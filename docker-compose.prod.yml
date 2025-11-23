@@ -1,0 +1,140 @@
+version: "3.9"
+
+services:
+  # Traefik como Reverse Proxy e Gerenciador de SSL (Let's Encrypt)
+  traefik:
+    image: traefik:v2.11
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      # Habilita o dashboard do Traefik (opcional)
+      - --api.insecure=true
+      # Habilita o provedor Docker
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # Configura o entrypoint web (HTTP)
+      - --entrypoints.web.address=:80
+      # Configura o entrypoint websecure (HTTPS)
+      - --entrypoints.websecure.address=:443
+      # Configura o ACME (Let's Encrypt) para SSL
+      - --certificatesresolvers.le.acme.email=${TRAEFIK_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/etc/traefik/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      # Redireciona HTTP para HTTPS
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+    ports:
+      - "80:80"
+      - "443:443"
+      # Porta do dashboard (opcional, apenas para debug)
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/etc/traefik/
+    networks:
+      - casadf
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: casadf
+      POSTGRES_PASSWORD: casadf
+      POSTGRES_DB: casadf
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U casadf"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [casadf]
+
+  redis:
+    image: redis:7-alpine
+    volumes: [redis_data:/data]
+    command: ["redis-server","--appendonly","yes"]
+    healthcheck:
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [casadf]
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Não expomos a porta diretamente, Traefik fará o roteamento
+    # ports: ["3001:3001"]
+    networks: [casadf]
+    labels:
+      - "traefik.enable=true"
+      # Roteamento para a API
+      - "traefik.http.routers.backend.rule=Host(`${DOMAIN_BACKEND}`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=le"
+      # Serviço interno
+      - "traefik.http.services.backend.loadbalancer.server.port=3001"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    env_file: .env
+    depends_on: [backend]
+    # Não expomos a porta diretamente, Traefik fará o roteamento
+    # ports: ["3000:3000"]
+    networks: [casadf]
+    labels:
+      - "traefik.enable=true"
+      # Roteamento para o Frontend
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN_FRONTEND}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=le"
+      # Serviço interno
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+
+  n8n:
+    image: n8nio/n8n:latest
+    env_file: .env
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      # O WEBHOOK_URL deve apontar para o domínio público
+      - WEBHOOK_URL=https://${DOMAIN_N8N}/
+    volumes: [n8n_data:/home/node/.n8n]
+    networks: [casadf]
+    labels:
+      - "traefik.enable=true"
+      # Roteamento para o n8n
+      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN_N8N}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=le"
+      # Serviço interno
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes: [qdrant_data:/qdrant/storage]
+    networks: [casadf]
+    # Não expomos o Qdrant publicamente, apenas internamente para o backend
+
+networks:
+  casadf:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:
+  qdrant_data:
+  traefik_data:
